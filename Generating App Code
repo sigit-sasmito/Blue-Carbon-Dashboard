@@ -102,7 +102,7 @@ var removalImg = ee.Image.pixelArea().divide(1e4)   // ha
 
 // Admin regions
 var idn_adm_region = ee.FeatureCollection(
-  'users/agekridalaksana/Boundary/BIG_2020_Indonesia_Province_Kabupaten_Island'
+  'projects/ee-restoremangrove/assets/Boundary/Indonesia_province_2021'
 );
 
 // Indonesia land + EEZ
