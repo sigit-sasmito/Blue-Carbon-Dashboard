@@ -1,0 +1,844 @@
+//---------------------------------------------------------------------
+// Title  : i-Mangrove Blue Carbon Dashboard App
+// Step   : Dashboard (maps + charts + restoration + AOI tools)
+// Revised: 19 Dec 2025 (archived stable build)
+//---------------------------------------------------------------------
+
+// ========================= CONFIG ========================= //
+var CFG = {
+  years: { start: 2001, end: 2024 },
+  nYears: 24,
+  scaleMap: 30,
+  scaleCharts: 900,
+  maxPixels: 1e13,
+  tileScale: 8,
+  bestEffort: true,
+
+  // Emission class bins (t CO2e per pixel, cumulative 2001–2024)
+  emisBins: { b1: 25, b2: 50, b3: 100, b4: 200 },
+
+  // Palettes
+  driverVis: {
+    min: 1,
+    max: 4,
+    palette: [
+      '#006d2c', // 1 forest/mangrove/peat
+      '#1f78b4', // 2 aquaculture
+      '#fd8d3c', // 3 other
+      '#6a3d9a'  // 4 degraded / non-forest
+    ]
+  },
+
+  emissionClassVis: {
+    min: 0,
+    max: 4,
+    palette: [
+      '#ffffcc', // 0 Very Low
+      '#fed976', // 1 Low
+      '#fd8d3c', // 2 Medium
+      '#f03b20', // 3 High
+      '#bd0026'  // 4 Very High
+    ]
+  },
+
+  restorationVis: {
+    min: 1,
+    max: 3,
+    palette: [
+      '#c7e9c0', // Low
+      '#74c476', // Medium
+      '#238b45'  // High
+    ]
+  },
+
+  removalVis: {
+    min: 0,
+    max: 2,
+    palette: ['#f7fcf5', '#c7e9c0', '#74c476', '#238b45', '#005a32']
+  }
+};
+
+
+// ========================= DATA ========================= //
+
+// Multi-band LC-masked loss per year (LC_masked_loss_2001..2024) [legacy retained]
+var mangrove_loss_drivers_2001_2024 = ee.Image(
+  'users/restoremangrove/02_mangrove_emission/mangrove_emission_mangrove_loss_drivers_2001_2024'
+);
+
+// Single-band MBI Col 4 LC on total mangrove loss pixels 2001–2024
+var mbi_col4_loss_2024 = ee.Image(
+  'users/restoremangrove/01_MRMT/MRMT_mbi_col4_in_loss_2024'
+);
+
+// Biogeomorphology image (classes 1..5)
+var biogeomorphology = ee.Image(
+  'users/restoremangrove/02_mangrove_emission/mangrove_emission_biogeomorphology_v2'
+);
+
+// Hansen lossyear masked to mangrove: 1..24 → 2001..2024
+var lossyear_mangrove = ee.Image(
+  'users/restoremangrove/02_mangrove_emission/mangrove_emission_hansen_lossyear_v12'
+);
+
+// Mangrove restoration potential: 1=Low, 2=Medium, 3=High
+var new_potential_restoration_mbi = ee.Image(
+  'users/restoremangrove/01_MRMT/MRMT_new_potential_restoration_mbi_2024_v3'
+);
+
+var restorationImg = new_potential_restoration_mbi
+  .updateMask(new_potential_restoration_mbi.gt(0))
+  .rename('RestorationClass');
+
+// Removal rate in t CO2e / ha / yr
+// NOTE: Your comment earlier referenced 14.68 t/ha/yr, but script uses 1.3212.
+// Keep as-is for reproducibility; adjust here if needed.
+var REMOVAL_RATE_HA = 1.3212;
+
+var removalImg = ee.Image.pixelArea().divide(1e4)   // ha
+  .multiply(REMOVAL_RATE_HA)                        // t CO2e/yr per pixel
+  .updateMask(restorationImg.gte(2))
+  .rename('Removal_tCO2e_yr');
+
+// Admin regions
+var idn_adm_region = ee.FeatureCollection(
+  'users/agekridalaksana/Boundary/BIG_2020_Indonesia_Province_Kabupaten_Island'
+);
+
+// Indonesia land + EEZ
+var geometry = ee.FeatureCollection(
+  'projects/ee-restoremangrove/assets/Boundary/Indonesia_land_EEZ'
+);
+
+var geometryAll = geometry.geometry();
+
+// Years
+var YEARS = ee.List.sequence(CFG.years.start, CFG.years.end);
+var year_list = ee.List.sequence(CFG.years.start, CFG.years.end).getInfo(); // safe here (24 ints)
+var yearListEE = ee.List(year_list);
+
+
+// ========================= HELPERS ========================= //
+
+// Legacy helper retained (not used in static driver workflow)
+function simplifyForYear(year) {
+  year = ee.Number(year).int();
+  var yearStr = year.format('%d');
+  var bandName = ee.String('LC_masked_loss_').cat(yearStr);
+  var band = mangrove_loss_drivers_2001_2024.select(bandName);
+
+  var simplified = ee.Image.constant(2);
+  simplified = simplified.updateMask(band.neq(27));
+
+  simplified = simplified
+    .where(band.eq(1),  0)
+    .where(band.eq(3),  0)
+    .where(band.eq(5),  0)
+    .where(band.eq(76), 0);
+
+  simplified = simplified.where(band.eq(13), 3);
+  simplified = simplified.where(band.eq(31), 1);
+
+  return simplified.selfMask();
+}
+
+// Simplify MapBiomas driver codes into EF driver categories
+// 1 = forest/mangrove/peat; 2 = aquaculture; 3 = other (default); 4 = degraded
+function simplifyDrivers(lcImg) {
+  var drv = ee.Image.constant(3).rename('driver');
+  drv = drv.updateMask(lcImg.neq(27));
+
+  drv = drv.where(lcImg.eq(1),  1);
+  drv = drv.where(lcImg.eq(3),  1);
+  drv = drv.where(lcImg.eq(5),  1);
+  drv = drv.where(lcImg.eq(76), 1);
+
+  drv = drv.where(lcImg.eq(13), 4);
+  drv = drv.where(lcImg.eq(31), 2);
+
+  return drv.updateMask(lcImg.mask());
+}
+
+// reduceRegion wrapper (timeout-resistant)
+function rr(img, geom, reducer, scale) {
+  return img.reduceRegion({
+    reducer: reducer,
+    geometry: geom,
+    scale: scale,
+    maxPixels: CFG.maxPixels,
+    bestEffort: CFG.bestEffort,
+    tileScale: CFG.tileScale
+  });
+}
+
+
+// ========================= LOSS SETUP ========================= //
+
+// Annual loss (ha per pixel)
+function lossImageForYear(year) {
+  year = ee.Number(year);
+  var code = year.subtract(2000);
+  var mask = lossyear_mangrove.eq(code);
+
+  return mask
+    .multiply(ee.Image.pixelArea().divide(1e4))
+    .rename('Loss_ha')
+    .set('year', year);
+}
+
+var lossCol = ee.ImageCollection(
+  YEARS.map(function(y) { return lossImageForYear(y); })
+);
+
+var totalLoss = lossCol.sum().rename('Loss_total');
+
+
+// ========================= EMISSION FACTORS & EMISSIONS ========================= //
+
+var efCodes  = ee.List([
+  6, 11, 16, 21, 26,
+  7, 12, 17, 22, 27,
+  8, 13, 18, 23, 28,
+  9, 14, 19, 24, 29
+]);
+
+var efValues = ee.List([
+  44.72590109, 35.00049691, 112.55285580, 36.42845736, 40.78641886,
+  244.94853354, 236.09886983, 236.42846013, 362.09667811, 262.98763746,
+  44.72590109, 37.51423020, 112.55285580, 36.42845736, 40.78641886,
+  44.72590109, 37.51423020, 112.55285580, 36.42845736, 40.78641886
+]);
+
+var driverStatic = simplifyDrivers(mbi_col4_loss_2024).rename('driver_static');
+var driversTotal = driverStatic.rename('Driver_total');
+
+var emission_all = null;
+
+for (var j = 0; j < year_list.length; j++) {
+  var y = ee.Number(year_list[j]);
+  var code = y.subtract(2000);
+
+  var lossMaskYear = lossyear_mangrove.eq(code).selfMask();
+  var drvImg = driverStatic.updateMask(lossMaskYear);
+
+  var bio = biogeomorphology.unmask(0);
+  var drv = drvImg.unmask(0);
+
+  var composite = drv.add(bio.multiply(5)).updateMask(drvImg);
+  var efImg = composite.remap(efCodes, efValues, 0);
+
+  var yearStr = y.format('%d');
+  var emissionYear = efImg
+    .multiply(ee.Image.pixelArea().divide(1e4))
+    .rename(ee.String('emission_').cat(yearStr));
+
+  emission_all = (j === 0) ? emissionYear : emission_all.addBands(emissionYear);
+}
+
+var emissionTotal = emission_all.reduce(ee.Reducer.sum()).rename('Emission_total');
+var annualEmissionImg = emissionTotal.divide(CFG.nYears).rename('AnnualEmission_tCO2e_yr');
+
+function emissionImageForYear(y) {
+  y = ee.Number(y);
+  var yearStr = y.format('%d');
+  var bandName = ee.String('emission_').cat(yearStr);
+
+  return emission_all
+    .select(bandName)
+    .divide(1e6)
+    .rename('Emission_Mt')
+    .set('year', y);
+}
+
+var emissionCol = ee.ImageCollection(
+  yearListEE.map(function(y) { return emissionImageForYear(y); })
+);
+
+
+// ========================= UI APP LAYOUT ========================= //
+
+ui.root.clear();
+
+// ----- MAP (single definition) -----
+var mainMap = ui.Map();
+mainMap.setControlVisibility({layerList: true, fullscreenControl: false});
+mainMap.centerObject(geometryAll, 5);
+
+// Custom dark basemap style JSON
+var darkStyle = [
+  { elementType: 'geometry', stylers: [{ color: '#1f1f1f' }] },
+  { elementType: 'labels.text.stroke', stylers: [{ color: '#1f1f1f' }] },
+  { elementType: 'labels.text.fill', stylers: [{ color: '#8d8d8d' }] },
+  { featureType: 'administrative', elementType: 'geometry',
+    stylers: [{ visibility: 'on' }, { color: '#303030' }] },
+  { featureType: 'landscape', elementType: 'geometry', stylers: [{ color: '#262626' }] },
+  { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#000000' }] },
+  { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#333333' }] },
+  { featureType: 'road', elementType: 'labels.text.fill', stylers: [{ color: '#8d8d8d' }] },
+  { featureType: 'poi', elementType: 'geometry', stylers: [{ color: '#262626' }] },
+  { featureType: 'poi.park', elementType: 'geometry', stylers: [{ color: '#283618' }] }
+];
+
+// Register basemaps safely
+mainMap.setOptions('SATELLITE', {
+  'SATELLITE': null,
+  'Dark Background': darkStyle
+});
+
+
+// ----- DRAWING TOOLS (AOI) -----
+var drawingTools = mainMap.drawingTools();
+drawingTools.setShown(false);
+drawingTools.setLinked(false);
+
+while (drawingTools.layers().length() > 0) {
+  drawingTools.layers().remove(drawingTools.layers().get(0));
+}
+
+var aoiLayer = ui.Map.GeometryLayer({geometries: null, name: 'AOI', color: 'red'});
+drawingTools.layers().add(aoiLayer);
+
+var currentCustomGeom = null;
+
+function clearGeometry() {
+  var layers = drawingTools.layers();
+  if (layers.length() > 0) {
+    var geoms = layers.get(0).geometries();
+    if (geoms.length() > 0) geoms.remove(geoms.get(0));
+  }
+}
+
+function drawRectangle() {
+  clearGeometry();
+  drawingTools.setShape('rectangle');
+  drawingTools.draw();
+}
+
+function drawPolygon() {
+  clearGeometry();
+  drawingTools.setShape('polygon');
+  drawingTools.draw();
+}
+
+function refreshCustomGeometry() {
+  var layers = drawingTools.layers();
+  if (layers.length() === 0) return;
+
+  var layer = layers.get(0);
+  var geoms = layer.geometries();
+  if (geoms.length() === 0) {
+    currentCustomGeom = null;
+    return;
+  }
+
+  currentCustomGeom = layer.getEeObject();
+  drawingTools.setShape(null);
+
+  var geom = getCurrentGeometry();
+  updateCharts(geom);
+  updateMaps(geom);
+}
+
+drawingTools.onDraw(ui.util.debounce(refreshCustomGeometry, 400));
+drawingTools.onEdit(ui.util.debounce(refreshCustomGeometry, 400));
+
+
+// ========================= REGION SELECTION ========================= //
+
+var provinceField = 'ENG_WADMPR';
+
+// Build UI first with placeholder region items; populate async for stability
+var regionSelect = ui.Select({
+  items: ['Indonesia (All)'],
+  value: 'Indonesia (All)',
+  style: {width: '250px'}
+});
+
+// Populate provinces async (no getInfo blocking)
+idn_adm_region.aggregate_array(provinceField).distinct().sort().evaluate(function(list) {
+  list = list || [];
+  regionSelect.items().reset(['Indonesia (All)'].concat(list));
+});
+
+
+// ----- CONTROLS PANEL -----
+var titleLabel = ui.Label({
+  value: 'i-Mangrove 2.0 Blue Carbon Dashboard',
+  style: {fontWeight: 'bold', fontSize: '24px', margin: '0 0 4px 0', color: '#739900'}
+});
+
+var subtitle = ui.Label({
+  value:
+    'i-Mangrove Blue Carbon Dashboard advances Big Earth Data for mangrove conservation and restoration by ' +
+    'providing dashboards for mangrove loss and loss drivers, carbon emissions, restoration potential opportunities ' +
+    'and climate change mitigation outcomes.',
+  style: {fontWeight: 'normal', fontSize: '12px', margin: '6px 0 6px 0'}
+});
+
+var showLossCheckbox = ui.Checkbox({ label: 'Show loss drivers 2001–2024 on map', value: false });
+var showTotalEmissionCheckbox = ui.Checkbox({ label: 'Show total emission 2001–2024 on map', value: true });
+var showRestorationCheckbox = ui.Checkbox({ label: 'Show restoration potential on map', value: false });
+var showRemovalCheckbox = ui.Checkbox({ label: 'Show carbon removal potential on map', value: false });
+
+var darkBasemapCheckbox = ui.Checkbox({
+  label: 'Dark Background basemap',
+  value: false,
+  onChange: function(v) {
+    mainMap.setOptions(v ? 'Dark Background' : 'SATELLITE', {
+      'SATELLITE': null,
+      'Dark Background': darkStyle
+    });
+  }
+});
+
+// Total statistics labels
+var totalLossInfo = ui.Label('Annual mangrove loss 2001–2024 (ha/yr): …', {fontSize: '12px'});
+var totalEmisInfo = ui.Label('Annual emission 2001–2024 (Mt CO₂e/yr): …', {fontSize: '12px'});
+var totalRestInfo = ui.Label('Total restoration potential area (ha): …', {fontSize: '12px'});
+var totalRemovalInfo = ui.Label('Carbon removal potential (Mt CO₂e/yr): …', {fontSize: '12px'});
+
+// AOI instructions
+var aoiInstructionLabel = ui.Label('Custom AOI (optional):', {
+  fontWeight: 'bold', margin: '8px 0 0 0', fontSize: '12px'
+});
+
+var aoiSteps = ui.Label(
+  '1. Pan/zoom map.\n' +
+  '2. Choose Rectangle or Polygon.\n' +
+  '3. Draw AOI on the map.\n' +
+  '4. Maps + charts update for AOI.',
+  {fontSize: '12px', whiteSpace: 'pre'}
+);
+
+var rectButton = ui.Button({
+  label: '⬛ Rectangle AOI',
+  onClick: drawRectangle,
+  style: {stretch: 'horizontal', fontSize: '11px'}
+});
+
+var polyButton = ui.Button({
+  label: '🔺 Polygon AOI',
+  onClick: drawPolygon,
+  style: {stretch: 'horizontal', fontSize: '11px'}
+});
+
+var clearAoiButton = ui.Button({
+  label: '🧹 Clear AOI (use region)',
+  onClick: function() {
+    currentCustomGeom = null;
+    clearGeometry();
+    var geom = getCurrentGeometry();
+    updateCharts(geom);
+    updateMaps(geom);
+  },
+  style: {stretch: 'horizontal', fontSize: '11px'}
+});
+
+var controlPanel = ui.Panel({
+  widgets: [
+    titleLabel,
+    subtitle,
+    darkBasemapCheckbox,
+    showLossCheckbox,
+    showTotalEmissionCheckbox,
+    showRestorationCheckbox,
+    showRemovalCheckbox,
+    ui.Label('Select admin region:', {fontWeight: 'bold', margin: '8px 0 0 0'}),
+    regionSelect,
+    aoiInstructionLabel,
+    aoiSteps,
+    rectButton,
+    polyButton,
+    clearAoiButton
+  ],
+  style: { width: '280px', padding: '8px', backgroundColor: 'white' }
+});
+
+
+// ----- CHARTS PANEL -----
+var chartLossPanel = ui.Panel();
+var chartEmissionPanel = ui.Panel();
+var chartComparisonPanel = ui.Panel();
+var chartRestorationPanel = ui.Panel();
+var chartLossDriverPanel = ui.Panel();
+
+var chartsPanel = ui.Panel({
+  widgets: [
+    ui.Label('Analysis Results', {fontWeight: 'bold', margin: '4px 0 4px 0'}),
+    ui.Label('', {height: '1px', backgroundColor: '#cccccc', margin: '4px 0 4px 0'}),
+    totalLossInfo,
+    totalEmisInfo,
+    totalRestInfo,
+    totalRemovalInfo,
+    chartLossPanel,
+    chartEmissionPanel,
+    chartComparisonPanel,
+    chartRestorationPanel,
+    chartLossDriverPanel
+  ],
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: { width: '400px', padding: '8px', backgroundColor: 'white' }
+});
+
+
+// ========================= LEGENDS ========================= //
+
+function makeLegendRow(color, labelText) {
+  var colorBox = ui.Label('', {
+    backgroundColor: color, padding: '6px', margin: '0 6px 0 0', border: '1px solid #999'
+  });
+  var label = ui.Label(labelText, {fontSize: '10px', margin: '0'});
+  return ui.Panel({
+    widgets: [colorBox, label],
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style: {margin: '0 0 2px 0'}
+  });
+}
+
+function makeLegendSection(title, rows) {
+  var section = ui.Panel({layout: ui.Panel.Layout.flow('vertical'), style: {margin: '0 0 6px 0'}});
+  section.add(ui.Label(title, {fontWeight: 'bold', fontSize: '11px', margin: '0 0 2px 0'}));
+  rows.forEach(function(r) { section.add(r); });
+  return section;
+}
+
+// One-column legend (simpler + more stable on narrow screens)
+var combinedLegend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '6px 8px',
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    maxWidth: '360px'
+  }
+});
+combinedLegend.add(ui.Label('Legend', {fontWeight: 'bold', fontSize: '12px', margin: '0 0 6px 0'}));
+
+combinedLegend.add(makeLegendSection('Loss drivers 2001–2024', [
+  makeLegendRow('#006d2c', 'Remaining forest / mangrove'),
+  makeLegendRow('#1f78b4', 'Aquaculture'),
+  makeLegendRow('#fd8d3c', 'Other'),
+  makeLegendRow('#6a3d9a', 'Degraded / non-forest')
+]));
+
+combinedLegend.add(makeLegendSection('Total emission 2001–2024 (t CO₂e)', [
+  makeLegendRow('#ffffcc', 'Very Low (0 – 25)'),
+  makeLegendRow('#fed976', 'Low (25 – 50)'),
+  makeLegendRow('#fd8d3c', 'Medium (50 – 100)'),
+  makeLegendRow('#f03b20', 'High (100 – 200)'),
+  makeLegendRow('#bd0026', 'Very High (> 200)')
+]));
+
+combinedLegend.add(makeLegendSection('Restoration potential', [
+  makeLegendRow('#c7e9c0', 'Low'),
+  makeLegendRow('#74c476', 'Medium'),
+  makeLegendRow('#238b45', 'High')
+]));
+
+combinedLegend.add(makeLegendSection('Carbon removal potential (t CO₂e/yr)', [
+  makeLegendRow('#f7fcf5', '0 – 0.5'),
+  makeLegendRow('#c7e9c0', '0.5 – 1.0'),
+  makeLegendRow('#74c476', '1.0 – 1.5'),
+  makeLegendRow('#238b45', '1.5 – 2.0'),
+  makeLegendRow('#005a32', '> 2.0')
+]));
+
+mainMap.add(combinedLegend);
+
+
+// Root layout: control panel – map – charts.
+var mainPanel = ui.Panel({
+  widgets: [
+    controlPanel,
+    ui.Panel([mainMap], null, {stretch: 'both'}),
+    chartsPanel
+  ],
+  layout: ui.Panel.Layout.flow('horizontal'),
+  style: {stretch: 'both'}
+});
+ui.root.add(mainPanel);
+
+
+// ========================= DYNAMIC BEHAVIOUR ========================= //
+
+var driverLayer  = null;
+var emisLayer    = null;
+var restLayer    = null;
+var removalLayer = null;
+
+function getCurrentGeometry() {
+  if (currentCustomGeom !== null) return currentCustomGeom;
+
+  var val = regionSelect.getValue();
+  if (val === 'Indonesia (All)') return geometryAll;
+
+  return idn_adm_region
+    .filter(ee.Filter.eq(provinceField, val))
+    .geometry()
+    .intersection(geometryAll, 1);
+}
+
+function updateMaps(regionGeom) {
+  var showLossDrivers = showLossCheckbox.getValue();
+  var showEmTot       = showTotalEmissionCheckbox.getValue();
+  var showRest        = showRestorationCheckbox.getValue();
+  var showRemoval     = showRemovalCheckbox.getValue();
+
+  var lossImg   = totalLoss.clip(regionGeom);
+  var driverImg = driversTotal.clip(regionGeom);
+  var emisImg   = emissionTotal.clip(regionGeom);
+  var restImg   = restorationImg.clip(regionGeom);
+  var removalImgRegion = removalImg.clip(regionGeom);
+
+  var b1 = CFG.emisBins.b1, b2 = CFG.emisBins.b2, b3 = CFG.emisBins.b3, b4 = CFG.emisBins.b4;
+
+  var emisClassImg = ee.Image(0)
+    .where(emisImg.gt(b1), 1)
+    .where(emisImg.gt(b2), 2)
+    .where(emisImg.gt(b3), 3)
+    .where(emisImg.gt(b4), 4)
+    .updateMask(emisImg.gt(0))
+    .rename('EmissionClass');
+
+  driverLayer = ui.Map.Layer(driverImg, CFG.driverVis, 'Loss drivers 2001–2024', showLossDrivers);
+  emisLayer   = ui.Map.Layer(emisClassImg, CFG.emissionClassVis, 'Total emission 2001–2024 (t CO₂e)', showEmTot);
+  restLayer   = ui.Map.Layer(restImg, CFG.restorationVis, 'Restoration potential (Low/Med/High)', showRest);
+  removalLayer= ui.Map.Layer(removalImgRegion, CFG.removalVis, 'Carbon removal potential (t CO₂e/yr)', showRemoval);
+
+  // Deterministic layer rebuild
+  mainMap.layers().reset([driverLayer, emisLayer, restLayer, removalLayer]);
+  mainMap.centerObject(regionGeom, 5);
+
+  // Region totals (more timeout-resistant)
+  var lossDict = rr(lossImg, regionGeom, ee.Reducer.sum(), CFG.scaleMap);
+  var emisDict = rr(emisImg, regionGeom, ee.Reducer.sum(), CFG.scaleMap);
+
+  var restAreaImg = ee.Image.pixelArea().divide(1e4).updateMask(restImg).rename('Rest_ha');
+  var restDict = rr(restAreaImg, regionGeom, ee.Reducer.sum(), CFG.scaleMap);
+
+  var removalDict = rr(removalImgRegion, regionGeom, ee.Reducer.sum(), CFG.scaleMap);
+
+  lossDict.evaluate(function(d) {
+    var totalLossVal = (d && d.Loss_total) ? d.Loss_total : 0;
+    var annualLoss = totalLossVal / CFG.nYears;
+    totalLossInfo.setValue('Annual mangrove loss 2001–2024 (ha/yr, mean): ' + annualLoss.toFixed(0));
+  });
+
+  emisDict.evaluate(function(d) {
+    var totalEmis_t = (d && d.Emission_total) ? d.Emission_total : 0;
+    var annualEmis_t = totalEmis_t / CFG.nYears;
+    var totalEmis_Mt = totalEmis_t / 1e6;
+    var annualEmis_Mt = annualEmis_t / 1e6;
+
+    totalEmisInfo.setValue(
+      'Annual emission 2001–2024 (Mt CO₂e/yr, mean): ' +
+      annualEmis_Mt.toFixed(2) +
+      '  |  Total 2001–2024: ' +
+      totalEmis_Mt.toFixed(2) + ' Mt CO₂e'
+    );
+  });
+
+  restDict.evaluate(function(d) {
+    var v = (d && d.Rest_ha) ? d.Rest_ha : 0;
+    totalRestInfo.setValue('Total restoration potential area (ha): ' + v.toFixed(0));
+  });
+
+  removalDict.evaluate(function(d) {
+    var totalRem_t = (d && d.Removal_tCO2e_yr) ? d.Removal_tCO2e_yr : 0;
+    var totalRem_Mt = totalRem_t / 1e6;
+    totalRemovalInfo.setValue(
+      'Carbon removal potential (Mt CO₂e/yr, Medium+High restoration): ' + totalRem_Mt.toFixed(2)
+    );
+  });
+}
+
+
+// ========================= CHART HELPERS ========================= //
+
+function buildRestorationAreaSummary(regionGeom) {
+  var proj30 = restorationImg.projection();
+  var areaHa30 = ee.Image.pixelArea().divide(1e4).setDefaultProjection(proj30);
+
+  var areaBands30 = ee.Image.cat([
+    areaHa30.updateMask(restorationImg.eq(1)).rename('Low'),
+    areaHa30.updateMask(restorationImg.eq(2)).rename('Medium'),
+    areaHa30.updateMask(restorationImg.eq(3)).rename('High')
+  ]);
+
+  var areaBands90 = areaBands30
+    .reduceResolution({ reducer: ee.Reducer.sum(), maxPixels: 256 })
+    .reproject({ crs: proj30.crs(), scale: 90 });
+
+  var d = areaBands90.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: regionGeom,
+    scale: 90,
+    bestEffort: true,
+    tileScale: 16,
+    maxPixels: CFG.maxPixels
+  });
+
+  return ee.FeatureCollection([
+    ee.Feature(null, { restoration: 'Low',    area_ha: ee.Number(d.get('Low', 0)) }),
+    ee.Feature(null, { restoration: 'Medium', area_ha: ee.Number(d.get('Medium', 0)) }),
+    ee.Feature(null, { restoration: 'High',   area_ha: ee.Number(d.get('High', 0)) })
+  ]);
+}
+
+function buildDriverAreaSummary(regionGeom, scale) {
+  var areaHa = ee.Image.pixelArea().divide(1e4).updateMask(driversTotal.mask());
+
+  var grouped = areaHa.addBands(driversTotal.rename('driver'))
+    .reduceRegion({
+      reducer: ee.Reducer.sum().group({ groupField: 1, groupName: 'driver' }),
+      geometry: regionGeom,
+      scale: scale,
+      maxPixels: CFG.maxPixels,
+      bestEffort: true,
+      tileScale: 8
+    });
+
+  var groups = ee.List(grouped.get('groups', []));
+
+  return ee.FeatureCollection(groups.map(function(g) {
+    g = ee.Dictionary(g);
+    var code = ee.Number(g.get('driver'));
+    var area = ee.Number(g.get('sum'));
+
+    var label = ee.Algorithms.If(
+      code.eq(1), 'Remaining forest / mangrove',
+      ee.Algorithms.If(code.eq(2), 'Aquaculture',
+        ee.Algorithms.If(code.eq(4), 'Degraded / non-forest', 'Other')
+      )
+    );
+
+    return ee.Feature(null, { driver_id: code, driver: label, area_ha: area });
+  }));
+}
+
+function updateCharts(regionGeom) {
+  chartLossPanel.clear();
+  chartEmissionPanel.clear();
+  chartComparisonPanel.clear();
+  chartRestorationPanel.clear();
+  chartLossDriverPanel.clear();
+
+  var tsScale = CFG.scaleCharts;
+
+  var lossChart = ui.Chart.image.series({
+      imageCollection: lossCol,
+      region: regionGeom,
+      reducer: ee.Reducer.sum(),
+      scale: tsScale,
+      xProperty: 'year'
+    })
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Mangrove loss by year',
+      legend: { position: 'none' },
+      hAxis: { title: 'Year', slantedText: false },
+      vAxis: { title: 'Loss area (ha)' }
+    });
+  chartLossPanel.add(lossChart);
+
+  var emisChart = ui.Chart.image.series({
+      imageCollection: emissionCol,
+      region: regionGeom,
+      reducer: ee.Reducer.sum(),
+      scale: tsScale,
+      xProperty: 'year'
+    })
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Mangrove emissions by year',
+      legend: { position: 'none' },
+      hAxis: { title: 'Year', slantedText: false },
+      vAxis: { title: 'Total emission (Mt CO₂e)' }
+    });
+  chartEmissionPanel.add(emisChart);
+
+  var comparisonImg = annualEmissionImg.addBands(removalImg).clip(regionGeom);
+  var compDict = rr(comparisonImg, regionGeom, ee.Reducer.sum(), tsScale);
+
+  var annualEmis_Mt_chart = ee.Number(compDict.get('AnnualEmission_tCO2e_yr')).divide(1e6);
+  var annualRem_Mt_chart  = ee.Number(compDict.get('Removal_tCO2e_yr')).divide(1e6);
+
+  var compFC = ee.FeatureCollection([
+    ee.Feature(null, {category: 'Reducing emission potential', value_Mt: annualEmis_Mt_chart}),
+    ee.Feature(null, {category: 'Removal potential',           value_Mt: annualRem_Mt_chart})
+  ]);
+
+  var comparisonChart = ui.Chart.feature.byFeature({
+      features: compFC,
+      xProperty: 'category',
+      yProperties: ['value_Mt']
+    })
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Reducing carbon emissions and removal potentials',
+      legend: { position: 'none' },
+      vAxis: { title: 'Mt CO₂e/yr' },
+      hAxis: { title: '' },
+      colors: ['#f03b20', '#238b45']
+    });
+  chartComparisonPanel.add(comparisonChart);
+
+  var restoFC = buildRestorationAreaSummary(regionGeom);
+  var restoChart = ui.Chart.feature.byFeature({
+    features: restoFC,
+    xProperty: 'restoration',
+    yProperties: ['area_ha']
+  })
+  .setChartType('PieChart')
+  .setOptions({
+    title: 'Restoration potential area (ha)',
+    legend: { position: 'top' },
+    pieHole: 0.3,
+    slices: {
+      0: { color: '#c7e9c0' },
+      1: { color: '#74c476' },
+      2: { color: '#238b45' }
+    }
+  });
+  chartRestorationPanel.add(restoChart);
+
+  var driverFC = buildDriverAreaSummary(regionGeom, tsScale).sort('driver_id');
+  var driverChart = ui.Chart.feature.byFeature({
+      features: driverFC,
+      xProperty: 'driver',
+      yProperties: ['area_ha']
+    })
+    .setChartType('PieChart')
+    .setOptions({
+      title: 'Mangrove loss drivers 2001–2024 (area, ha)',
+      legend: { position: 'right' },
+      pieHole: 0.3,
+      slices: {
+        0: { color: '#006d2c' },
+        1: { color: '#1f78b4' },
+        2: { color: '#fd8d3c' },
+        3: { color: '#6a3d9a' }
+      }
+    });
+  chartLossDriverPanel.add(driverChart);
+}
+
+
+// ========================= EVENTS & INIT ========================= //
+
+regionSelect.onChange(function() {
+  currentCustomGeom = null;
+  clearGeometry();
+  var geom = getCurrentGeometry();
+  updateCharts(geom);
+  updateMaps(geom);
+});
+
+showLossCheckbox.onChange(function(val) { if (driverLayer) driverLayer.setShown(val); });
+showTotalEmissionCheckbox.onChange(function(val) { if (emisLayer) emisLayer.setShown(val); });
+showRestorationCheckbox.onChange(function(val) { if (restLayer) restLayer.setShown(val); });
+showRemovalCheckbox.onChange(function(val) { if (removalLayer) removalLayer.setShown(val); });
+
+// Initial
+var initialGeom = geometryAll;
+updateCharts(initialGeom);
+updateMaps(initialGeom);
