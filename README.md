@@ -15,3 +15,9 @@ The analysis is primarily based on **spatial overlays of published and pre-proce
 ## Platform
 
 All scripts are developed to run in the **Google Earth Engine** Code Editor and can be adapted for deployment as a **GEE App** (interactive dashboard).
+
+## Notes for reproducibility
+
+- The scripts reference specific GEE assets (Image / FeatureCollection paths). Users must have access to these assets or replace them with equivalent public datasets.
+- Default spatial resolution and chart aggregation scales are defined in the configuration section of the script.
+- Results depend on the chosen emission factors and restoration removal rates documented in the code.
